@@ -7,21 +7,20 @@ import java.util.concurrent.{CancellationException, ThreadFactory}
 import akka.actor.{Address, ExtendedActorSystem}
 import akka.event.Logging
 import akka.remote.RARP
-import akka.remote.transport.AssociationHandle.HandleEventListener
-import akka.remote.transport.Transport.{AssociationEventListener, InboundAssociation}
+import akka.remote.transport.Transport.AssociationEventListener
 import akka.remote.transport.netty.NettyTransportSettings.{Tcp, Udp}
 import akka.remote.transport.netty.{NettyTransportException, NettyTransportSettings}
 import akka.remote.transport.{AssociationHandle, Transport}
 import akka.util.Helpers
 import com.typesafe.config.Config
-import io.netty.bootstrap.ServerBootstrap
-import io.netty.buffer.{ByteBuf, Unpooled}
-import io.netty.channel.epoll.{Epoll, EpollEventLoopGroup, EpollServerSocketChannel}
+import io.netty.bootstrap.{Bootstrap, ServerBootstrap}
+import io.netty.buffer.Unpooled
+import io.netty.channel._
+import io.netty.channel.epoll.{Epoll, EpollDatagramChannel, EpollEventLoopGroup, EpollServerSocketChannel}
 import io.netty.channel.group.{ChannelGroup, ChannelGroupFuture, ChannelGroupFutureListener, DefaultChannelGroup}
 import io.netty.channel.nio.NioEventLoopGroup
 import io.netty.channel.socket.SocketChannel
-import io.netty.channel.socket.nio.NioServerSocketChannel
-import io.netty.channel.{ChannelHandlerContext, _}
+import io.netty.channel.socket.nio.{NioDatagramChannel, NioServerSocketChannel}
 import io.netty.handler.codec.{LengthFieldBasedFrameDecoder, LengthFieldPrepender}
 import io.netty.util.concurrent.GlobalEventExecutor
 
@@ -142,6 +141,7 @@ class Netty4TransportSettings(config: Config) extends NettyTransportSettings(con
 
   val ServerSocketThreadName = getString("server-socket-pool-name")
   val ClientSocketThreadName = getString("client-socket-pool-name")
+  val ReceiveBufferSizePredictor = getInt("receive-buffer-size-predictor")
 }
 
 class NettyTransport(val settings: Netty4TransportSettings, val system: ExtendedActorSystem) extends Transport {
@@ -159,8 +159,11 @@ class NettyTransport(val settings: Netty4TransportSettings, val system: Extended
 
   val bossEventLoopGroup = createEventLoopGroup(1,
     namedThreadFactory(1, s"${ServerSocketThreadName}_Boss", true))
-  val workEventLoopGroup = createEventLoopGroup(ServerSocketWorkerPoolSize,
-    namedThreadFactory(ServerSocketWorkerPoolSize, s"${ServerSocketThreadName}_Worker", false))
+  val workEventLoopGroup = TransportMode match {
+    case Tcp => Some(createEventLoopGroup(ServerSocketWorkerPoolSize,
+      namedThreadFactory(ServerSocketWorkerPoolSize, s"${ServerSocketThreadName}_Worker", false)))
+    case Udp => None
+  }
 
   /** 存放所有Server端连接的channel */
   val channelGroup = new DefaultChannelGroup("akka-netty-transport-driver-channelgroup-" +
@@ -170,14 +173,13 @@ class NettyTransport(val settings: Netty4TransportSettings, val system: Extended
   @volatile private var localAddress: Address = _
   @volatile private var boundTo: Address = _
 
-
   private val associationListenerPromise: Promise[AssociationEventListener] = Promise()
 
+  import java.lang.{Boolean => JBoolean}
   val inboundBootstrap = TransportMode match {
     case Tcp => {
-      import java.lang.{Boolean => JBoolean}
       val b = new ServerBootstrap()
-      b.group(bossEventLoopGroup, workEventLoopGroup)
+      b.group(bossEventLoopGroup, workEventLoopGroup.get)
       isUseEpoll match {
         case true => b.channel(classOf[EpollServerSocketChannel])
         case false => b.channel(classOf[NioServerSocketChannel])
@@ -194,6 +196,9 @@ class NettyTransport(val settings: Netty4TransportSettings, val system: Extended
       b.childHandler(new ChannelInitializer[SocketChannel]() {
         override def initChannel(ch: SocketChannel): Unit = {
           val pipeline = ch.pipeline()
+          if (EnableSsl) {
+            pipeline.addFirst("sslHandler", sslHandler(false))
+          }
           pipeline.addLast("FrameDecoder", new LengthFieldBasedFrameDecoder(
             maximumPayloadBytes,
             0,
@@ -203,7 +208,6 @@ class NettyTransport(val settings: Netty4TransportSettings, val system: Extended
             true
           ))
           pipeline.addLast("FrameEncoder", new LengthFieldPrepender(FrameLengthFieldLength))
-          // TODO: need add a ssl context and tcp handler
 
           val handler = new TcpServerHandler(NettyTransport.this, associationListenerPromise.future, log)
           pipeline.addLast("ServerHandler", handler)
@@ -212,7 +216,40 @@ class NettyTransport(val settings: Netty4TransportSettings, val system: Extended
       b
     }
     case Udp => {
+      val b = new Bootstrap()
+      b.group(bossEventLoopGroup)
+      isUseEpoll match {
+        case true => b.channel(classOf[EpollDatagramChannel])
+        case false => b.channel(classOf[NioDatagramChannel])
+      }
+      b.option[Integer](ChannelOption.SO_BACKLOG, Backlog)
+        .option[JBoolean](ChannelOption.SO_REUSEADDR, TcpReuseAddr)
+        .option[JBoolean](ChannelOption.SO_KEEPALIVE, TcpKeepalive)
+      SendBufferSize.foreach(size => b.option[Integer](ChannelOption.SO_SNDBUF, size))
+      ReceiveBufferSize.foreach(size => b.option[Integer](ChannelOption.SO_RCVBUF, size))
+      if (ReceiveBufferSizePredictor > 0) {
+        b.option(ChannelOption.RCVBUF_ALLOCATOR, new FixedRecvByteBufAllocator(ReceiveBufferSizePredictor))
+      }
 
+      b.handler(new ChannelInitializer[Channel]() {
+        override def initChannel(ch: Channel): Unit = {
+          val pipeline = ch.pipeline()
+          if (EnableSsl) {
+            pipeline.addFirst("sslHandler", sslHandler(false))
+          }
+          pipeline.addLast("FrameDecoder", new LengthFieldBasedFrameDecoder(
+            maximumPayloadBytes,
+            0,
+            FrameLengthFieldLength,
+            0,
+            FrameLengthFieldLength, // Strip the header
+            true
+          ))
+          pipeline.addLast("FrameEncoder", new LengthFieldPrepender(FrameLengthFieldLength))
+          val handler = new UdpServerClient(NettyTransport.this, associationListenerPromise.future, log)
+          pipeline.addLast("ServerHandler", handler)
+        }
+      })
     }
   }
 
@@ -294,4 +331,8 @@ class NettyTransport(val settings: Netty4TransportSettings, val system: Extended
   override def associate(remoteAddress: Address): Future[AssociationHandle] = ???
 
   override def shutdown(): Future[Boolean] = ???
+
+  private def sslHandler(isClient: Boolean) = {
+    SslNettySupport(SslSettings.get, log, isClient)
+  }
 }
