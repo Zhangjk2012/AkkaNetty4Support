@@ -22,7 +22,7 @@ import io.netty.channel.nio.NioEventLoopGroup
 import io.netty.channel.socket.SocketChannel
 import io.netty.channel.socket.nio.{NioDatagramChannel, NioServerSocketChannel}
 import io.netty.handler.codec.{LengthFieldBasedFrameDecoder, LengthFieldPrepender}
-import io.netty.util.concurrent.GlobalEventExecutor
+import io.netty.util.concurrent.{DefaultPromise, GenericFutureListener, GlobalEventExecutor}
 
 import scala.concurrent.{ExecutionContext, Future, Promise, blocking}
 import scala.util.Try
@@ -77,6 +77,7 @@ private[transport] object NettyTransport {
     })
     p.future
   }
+
 
   def channelGroupFuture2ScalaFuture(channelFuture: ChannelGroupFuture) = {
     val p = Promise[ChannelGroup]()
@@ -166,8 +167,8 @@ class NettyTransport(val settings: Netty4TransportSettings, val system: Extended
   }
 
   /** 存放所有Server端连接的channel */
-  val channelGroup = new DefaultChannelGroup("akka-netty-transport-driver-channelgroup-" +
-    uniqueIdCounter.getAndIncrement, GlobalEventExecutor.INSTANCE)
+//  val channelGroup = new DefaultChannelGroup("akka-netty-transport-driver-channelgroup-" +
+//    uniqueIdCounter.getAndIncrement, GlobalEventExecutor.INSTANCE)
 
   @volatile private var serverChannel: Channel = _
   @volatile private var localAddress: Address = _
@@ -288,8 +289,7 @@ class NettyTransport(val settings: Netty4TransportSettings, val system: Extended
         // Block reads until a handler actor is registered
         newServerChannel.config().setAutoRead(false);
 
-        // fixme 这里需要把自己也添加进去？
-        channelGroup.add(newServerChannel)
+//        channelGroup.add(newServerChannel)
 
         serverChannel = newServerChannel
 
@@ -330,7 +330,26 @@ class NettyTransport(val settings: Netty4TransportSettings, val system: Extended
 
   override def associate(remoteAddress: Address): Future[AssociationHandle] = ???
 
-  override def shutdown(): Future[Boolean] = ???
+  override def shutdown(): Future[Boolean] = {
+    val promise = Promise[Boolean]()
+
+    val bossFuture = bossEventLoopGroup.shutdownGracefully()
+    val workerFuture = workEventLoopGroup match {
+      case Some(group) =>
+        group.shutdownGracefully()
+      case None =>
+        val promise = new DefaultPromise[Boolean](GlobalEventExecutor.INSTANCE)
+        promise.setSuccess(true)
+        promise
+    }
+    //fixme this use maybe not well, change it
+    promise.completeWith(Future({
+      bossFuture.await()
+      workerFuture.await()
+      true
+    }))
+    promise.future
+  }
 
   private def sslHandler(isClient: Boolean) = {
     SslNettySupport(SslSettings.get, log, isClient)
